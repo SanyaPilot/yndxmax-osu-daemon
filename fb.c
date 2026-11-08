@@ -111,7 +111,7 @@ int fb_init() {
     fb_info.buf_len = fb_height * finfo.line_length;
     fb_info.buf = mmap(0, fb_info.buf_len,
             PROT_READ | PROT_WRITE, MAP_SHARED, fbfd, (off_t)0);
-    if (fb_info.buf < 0) {
+    if (fb_info.buf == MAP_FAILED) {
         perror("Failed to mmap the framebuffer");
         close(fbfd);
         return errno;

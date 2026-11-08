@@ -173,24 +173,23 @@ void *input_read_thread(void *data) {
             sprintf(buf, "ring:%s", event.code == KEY_PAGEUP ? "cw" : "ccw");
             if (sendto(args->sockfd, buf, strlen(buf), 0,
                         (const struct sockaddr *)args->cliaddr, *args->cli_len) < 0) {
-                perror("sendto failed!");
-                break;
+                perror("sendto failed");
             }
         }
     }
 }
 
 int main() {
-    int err;
-    if ((err = fb_init()) < 0)
-        return err;
+    int ret = fb_init();
+    if (ret)
+        return ret;
 
     pthread_t d_thread;
     pthread_create(&d_thread, NULL, display_thread, NULL);
 
     struct sockaddr_in servaddr;
-    int sockfd;
-    if ((sockfd = socket(AF_INET, SOCK_DGRAM, 0)) < 0) {
+    int sockfd = socket(AF_INET, SOCK_DGRAM, 0);
+    if (sockfd < 0) {
         perror("Failed to create a socket");
         fb_close();
         return errno;
@@ -237,15 +236,21 @@ int main() {
             (struct sockaddr *)cliaddr, cli_len);
         if (n < 0) {
             perror("recvfrom failed");
-            fb_close();
-            close(fd);
-            close(sockfd);
-            return errno;
+            ret = errno;
+            break;
         }
         buf[n] = 0;
         printf("msg: %s\n", buf);
         char *token = strtok_r(buf, MSG_DELIM, &strtok_save);
-        if (strcmp(token, "display") == 0) {
+        if (strcmp(token, "ping") == 0) {
+            strcpy(buf, "pong");
+            if (sendto(sockfd, buf, strlen(buf), 0,
+                        (const struct sockaddr *)cliaddr, *cli_len) < 0) {
+                perror("sendto failed");
+                ret = errno;
+                break;
+            }
+        } else if (strcmp(token, "display") == 0) {
             token = strtok_r(NULL, MSG_DELIM, &strtok_save);
             if (token == NULL)
                 continue;
@@ -294,8 +299,8 @@ int main() {
         }
     }
 
+    fb_close();
     close(fd);
     close(sockfd);
-    printf("exit!\n");
-    return 0;
+    return ret;
 }
