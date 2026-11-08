@@ -22,21 +22,25 @@
 #define FRAME_TIME_NS (1000000000L / TARGET_FPS)
 #define FRAME_TIME_MS (1000 / TARGET_FPS)
 
+#define MSG_DELIM ":"
+
 enum display_state {
     DISPLAY_IDLE,
     DISPLAY_TIME,
     DISPLAY_SPM
 };
 
+static uint8_t display_state = DISPLAY_IDLE;
+
+static pthread_mutex_t ring_event_mutex = PTHREAD_MUTEX_INITIALIZER;
+static uint ring_event_count = 0;
+
+static pthread_mutex_t beatmap_timer_mutex = PTHREAD_MUTEX_INITIALIZER;
 static struct {
-    time_t accumulated;
+    double accumulated;
     struct timespec last_start;
     bool running;
 } beatmap_timer = { 0 };
-
-static uint8_t display_state = DISPLAY_IDLE;
-static pthread_mutex_t ring_event_mutex = PTHREAD_MUTEX_INITIALIZER;
-static uint ring_event_count = 0;
 
 struct input_thread_args {
     int fd;
@@ -59,12 +63,21 @@ static inline bool timespec_less(const struct timespec *a, const struct timespec
     return a->tv_nsec < b->tv_nsec;
 }
 
-static void draw_timer(time_t time, uint8_t y) {
-    if (time > 0) {
+static inline double timespec_diff(const struct timespec *a, const struct timespec *b) {
+    return (a->tv_sec - b->tv_sec) + (a->tv_nsec - b->tv_nsec) / 1e9;
+}
+
+static void draw_timer(int time, bool enabled, uint8_t y) {
+    if (enabled) {
+        bool negative = time < 0;
+        time = abs(time);
+
         uint8_t minutes = time / 60;
         uint8_t seconds = time % 60;
 
-        if (minutes >= 10) {
+        if (negative) {
+            draw_char(&digits_font, '-', 0, y);
+        } else if (minutes >= 10) {  // else if just in case we have -10 min offset... don't handle this
             draw_char(&digits_font, '0' + minutes / 10, 0, y);
         }
         draw_char(&digits_font, '0' + minutes % 10, digits_font.width, y);
@@ -75,7 +88,7 @@ static void draw_timer(time_t time, uint8_t y) {
         draw_string(&digits_font, "--", digits_font.width * 2 + 2, y);
     }
 
-    if (time % 2 == 0 || time < 0) {
+    if (time % 2 == 0 || !enabled) {
         set_pixel(digits_font.width * 2, y + 2, 255);
         set_pixel(digits_font.width * 2, y + 6, 255);
     }
@@ -97,7 +110,7 @@ void *display_thread(void *data) {
     uint8_t digit_y = (16 - digits_font.height) / 2;
     uint8_t div_y = digit_y + 2;
     uint8_t minutes, seconds;
-    time_t elapsed;
+    double elapsed;
 
     // SPM variables
     uint8_t spm_x = (25 - digits_font.width * 3) / 2;
@@ -106,14 +119,16 @@ void *display_thread(void *data) {
         fb_fill(0);
         switch (display_state) {
             case DISPLAY_IDLE:
-                draw_timer(-1, digit_y);
+                draw_timer(0, false, digit_y);
                 break;
 
             case DISPLAY_TIME:
+                pthread_mutex_lock(&beatmap_timer_mutex);
                 elapsed = beatmap_timer.accumulated;
                 if (beatmap_timer.running)
-                    elapsed += next_frame.tv_sec - beatmap_timer.last_start.tv_sec;
-                draw_timer(elapsed, digit_y);
+                    elapsed += timespec_diff(&next_frame, &beatmap_timer.last_start);
+                pthread_mutex_unlock(&beatmap_timer_mutex);
+                draw_timer(elapsed, true, digit_y);
                 break;
 
             case DISPLAY_SPM:
@@ -155,7 +170,7 @@ void *input_read_thread(void *data) {
             ring_event_count++;
             pthread_mutex_unlock(&ring_event_mutex);
             prev_code = event.code;
-            sprintf(buf, "evt:ring:%d", event.code);
+            sprintf(buf, "ring:%s", event.code == KEY_PAGEUP ? "cw" : "ccw");
             if (sendto(args->sockfd, buf, strlen(buf), 0,
                         (const struct sockaddr *)args->cliaddr, *args->cli_len) < 0) {
                 perror("sendto failed!");
@@ -216,6 +231,7 @@ int main() {
     pthread_create(&input_thread, NULL, input_read_thread, input_args);
 
     char buf[BUF_SIZE];
+    char *strtok_save;
     while (1) {
         ssize_t n = recvfrom(sockfd, &buf, BUF_SIZE - 1, 0,
             (struct sockaddr *)cliaddr, cli_len);
@@ -228,32 +244,53 @@ int main() {
         }
         buf[n] = 0;
         printf("msg: %s\n", buf);
-        if (strcmp(buf, "display:time") == 0) {
-            printf("Settings screen to TIME mode!\n");
-            display_state = DISPLAY_TIME;
-        } else if (strcmp(buf, "display:spm") == 0) {
-            printf("Settings screen to SPM mode!\n");
-            display_state = DISPLAY_SPM;
-        } else if (strcmp(buf, "action:start") == 0) {
-            printf("Beatmap started\n");
-            beatmap_timer.accumulated = 0;
-            clock_gettime(CLOCK_MONOTONIC, &beatmap_timer.last_start);
-            beatmap_timer.running = true;
-            display_state = DISPLAY_TIME;
-        } else if (strcmp(buf, "action:stop") == 0) {
-            printf("Beatmap stopped\n");
-            beatmap_timer.running = false;
-            display_state = DISPLAY_IDLE;
-        } else if (strcmp(buf, "action:pause") == 0) {
-            printf("Beatmap paused\n");
-            struct timespec now;
-            clock_gettime(CLOCK_MONOTONIC, &now);
-            beatmap_timer.accumulated += now.tv_sec - beatmap_timer.last_start.tv_sec;
-            beatmap_timer.running = false;
-        } else if (strcmp(buf, "action:resume") == 0) {
-            printf("Beatmap resumed\n");
-            clock_gettime(CLOCK_MONOTONIC, &beatmap_timer.last_start);
-            beatmap_timer.running = true;
+        char *token = strtok_r(buf, MSG_DELIM, &strtok_save);
+        if (strcmp(token, "display") == 0) {
+            token = strtok_r(NULL, MSG_DELIM, &strtok_save);
+            if (token == NULL)
+                continue;
+
+            if (strcmp(token, "time") == 0) {
+                printf("Settings screen to TIME mode!\n");
+                display_state = DISPLAY_TIME;
+            } else if (strcmp(token, "spm") == 0) {
+                printf("Settings screen to SPM mode!\n");
+                display_state = DISPLAY_SPM;
+            }
+        } else if (strcmp(token, "action") == 0) {
+            token = strtok_r(NULL, MSG_DELIM, &strtok_save);
+            if (token == NULL)
+                continue;
+
+            pthread_mutex_lock(&beatmap_timer_mutex);
+            if (strcmp(token, "start") == 0) {
+                token = strtok_r(NULL, MSG_DELIM, &strtok_save);
+                if (token == NULL) {
+                    pthread_mutex_unlock(&beatmap_timer_mutex);
+                    continue;
+                }
+                double offset = atof(token);
+                printf("Beatmap started, offset: %f\n", offset);
+                beatmap_timer.accumulated = offset;
+                clock_gettime(CLOCK_MONOTONIC, &beatmap_timer.last_start);
+                beatmap_timer.running = true;
+                display_state = DISPLAY_TIME;
+            } else if (strcmp(token, "stop") == 0) {
+                printf("Beatmap stopped\n");
+                beatmap_timer.running = false;
+                display_state = DISPLAY_IDLE;
+            } else if (strcmp(token, "pause") == 0) {
+                printf("Beatmap paused\n");
+                struct timespec now;
+                clock_gettime(CLOCK_MONOTONIC, &now);
+                beatmap_timer.accumulated += timespec_diff(&now, &beatmap_timer.last_start);
+                beatmap_timer.running = false;
+            } else if (strcmp(token, "resume") == 0) {
+                printf("Beatmap resumed\n");
+                clock_gettime(CLOCK_MONOTONIC, &beatmap_timer.last_start);
+                beatmap_timer.running = true;
+            }
+            pthread_mutex_unlock(&beatmap_timer_mutex);
         }
     }
 
