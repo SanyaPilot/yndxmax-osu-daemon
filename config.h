@@ -1,5 +1,6 @@
 #define FRAMEBUFFER     "/dev/graphics/fb4"
-#define EVENT_PATH      "/dev/input/event2"
+#define RING_EVENT_PATH "/dev/input/event2"
+#define BTN_EVENT_PATH  "/dev/input/event0"
 #define PORT            1337
 #define BUF_SIZE        32
 

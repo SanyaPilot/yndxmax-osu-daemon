@@ -6,12 +6,13 @@
 #include <sys/ioctl.h>
 #include <sys/types.h>
 #include <sys/param.h>
+#include <sys/mman.h>
+#include <sys/socket.h>
+#include <sys/poll.h>
 #include <unistd.h>
 #include <fcntl.h>
 #include <errno.h>
 #include <linux/input.h>
-#include <sys/mman.h>
-#include <sys/socket.h>
 #include <netinet/in.h>
 #include <pthread.h>
 #include <time.h>
@@ -43,7 +44,8 @@ static struct {
 } beatmap_timer = { 0 };
 
 struct input_thread_args {
-    int fd;
+    int btn_fd;
+    int ring_fd;
     int sockfd;
     struct sockaddr_in *cliaddr;
     socklen_t *cli_len;
@@ -159,24 +161,55 @@ void *input_read_thread(void *data) {
     struct input_event event;
     char buf[32];
     uint16_t prev_code = 0;
+    struct pollfd fds[] = {
+        { .fd = args->ring_fd, .events = POLLIN },
+        { .fd = args->btn_fd, .events = POLLIN }
+    };
 
-    while (read(args->fd, &event, sizeof(event)) > 0) {
-        printf("Read event! [%ld] type: %d code: %d val: %d\n",
-                event.time.tv_sec, event.type, event.code, event.value);
-        if (event.type == EV_KEY && event.value == 0) {
-            pthread_mutex_lock(&ring_event_mutex);
-            if (prev_code != event.code)
-                ring_event_count = 0;
-            ring_event_count++;
-            pthread_mutex_unlock(&ring_event_mutex);
-            prev_code = event.code;
-            sprintf(buf, "ring:%s", event.code == KEY_PAGEUP ? "cw" : "ccw");
-            if (sendto(args->sockfd, buf, strlen(buf), 0,
-                        (const struct sockaddr *)args->cliaddr, *args->cli_len) < 0) {
-                perror("sendto failed");
+    while (poll(fds, 2, -1) > 0) {
+        if (fds[0].revents & POLLIN) {
+            if (read(args->ring_fd, &event, sizeof(event)) > 0) {
+                printf("Ring event! [%ld] type: %d code: %d val: %d\n",
+                        event.time.tv_sec, event.type, event.code, event.value);
+
+                if (event.type == EV_KEY && event.value == 0) {
+                    pthread_mutex_lock(&ring_event_mutex);
+                    if (prev_code != event.code)
+                        ring_event_count = 0;
+                    ring_event_count++;
+                    pthread_mutex_unlock(&ring_event_mutex);
+                    prev_code = event.code;
+                    sprintf(buf, "ring:%s", event.code == KEY_PAGEUP ? "cw" : "ccw");
+                    if (sendto(args->sockfd, buf, strlen(buf), 0,
+                                (const struct sockaddr *)args->cliaddr, *args->cli_len) < 0) {
+                        perror("sendto failed");
+                    }
+                }
+            } else {
+                perror("Ring read failed");
+            }
+        }
+
+        if (fds[1].revents & POLLIN) {
+            if (read(args->btn_fd, &event, sizeof(event)) > 0) {
+                printf("Button event! [%ld] type: %d code: %d val: %d\n",
+                        event.time.tv_sec, event.type, event.code, event.value);
+
+                if (event.code == KEY_VOICECOMMAND) {
+                    sprintf(buf, "btn1:%s", event.value ? "dn" : "up");
+                } else if (event.code == KEY_MICMUTE) {
+                    strcpy(buf, "btn2");
+                }
+                if (sendto(args->sockfd, buf, strlen(buf), 0,
+                            (const struct sockaddr *)args->cliaddr, *args->cli_len) < 0) {
+                    perror("sendto failed");
+                }
+            } else {
+                perror("Button read failed");
             }
         }
     }
+    perror("poll failed");
 }
 
 int main() {
@@ -208,8 +241,9 @@ int main() {
 
     printf("Listening on port %d...\n", PORT);
 
-    int fd = open(EVENT_PATH, O_RDONLY);
-    if (fd < 0) {
+    int btn_fd = open(BTN_EVENT_PATH, O_RDONLY);
+    int ring_fd = open(RING_EVENT_PATH, O_RDONLY);
+    if (btn_fd < 0 || ring_fd < 0) {
         perror("Failed to open event device");
         fb_close();
         close(sockfd);
@@ -223,7 +257,8 @@ int main() {
 
     pthread_t input_thread;
     struct input_thread_args *input_args = malloc(sizeof(struct input_thread_args));
-    input_args->fd = fd;
+    input_args->btn_fd = btn_fd;
+    input_args->ring_fd = ring_fd;
     input_args->sockfd = sockfd;
     input_args->cliaddr = cliaddr;
     input_args->cli_len = cli_len;
@@ -300,7 +335,8 @@ int main() {
     }
 
     fb_close();
-    close(fd);
+    close(btn_fd);
+    close(ring_fd);
     close(sockfd);
     return ret;
 }
