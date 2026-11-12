@@ -78,21 +78,21 @@ static void draw_timer(int time, bool enabled, uint8_t y) {
         uint8_t seconds = time % 60;
 
         if (negative) {
-            draw_char(&digits_font, '-', 0, y);
+            draw_char(&screen, &digits_font, '-', 0, y);
         } else if (minutes >= 10) {  // else if just in case we have -10 min offset... don't handle this
-            draw_char(&digits_font, '0' + minutes / 10, 0, y);
+            draw_char(&screen, &digits_font, '0' + minutes / 10, 0, y);
         }
-        draw_char(&digits_font, '0' + minutes % 10, digits_font.width, y);
-        draw_char(&digits_font, '0' + seconds / 10, digits_font.width * 2 + 2, y);
-        draw_char(&digits_font, '0' + seconds % 10, digits_font.width * 3 + 2, y);
+        draw_char(&screen, &digits_font, '0' + minutes % 10, digits_font.width, y);
+        draw_char(&screen, &digits_font, '0' + seconds / 10, digits_font.width * 2 + 2, y);
+        draw_char(&screen, &digits_font, '0' + seconds % 10, digits_font.width * 3 + 2, y);
     } else {
-        draw_string(&digits_font, "--", 0, y);
-        draw_string(&digits_font, "--", digits_font.width * 2 + 2, y);
+        draw_string(&screen, &digits_font, "--", 0, y);
+        draw_string(&screen, &digits_font, "--", digits_font.width * 2 + 2, y);
     }
 
     if (time % 2 == 0 || !enabled) {
-        set_pixel(digits_font.width * 2, y + 2, 255);
-        set_pixel(digits_font.width * 2, y + 6, 255);
+        set_pixel(&screen, digits_font.width * 2, y + 2, 255);
+        set_pixel(&screen, digits_font.width * 2, y + 6, 255);
     }
 }
 
@@ -122,14 +122,14 @@ static void draw_frame(uint8_t digit_x, uint8_t digit_y, uint8_t spm_x, struct t
             ring_event_count = 0;
             pthread_mutex_unlock(&ring_event_mutex);
             sprintf(str, "%03d", spm_capped);
-            draw_string(&digits_font, str, spm_x, digit_y);
+            draw_string(&screen, &digits_font, str, spm_x, digit_y);
             break;
     }
 }
 
 static void *display_thread(void *data) {
-    draw_string(&spleen_font, "osu", 0, 0);
-    fb_refresh();
+    draw_string(&screen, &spleen_font, "osu", 0, 0);
+    fb_refresh(&screen);
 
     sleep(2);
 
@@ -144,13 +144,13 @@ static void *display_thread(void *data) {
 
     while (1) {
         if (display_state != prev_state) {
-            fb_fade_out();
+            fb_fade_out(&screen);
             draw_frame(digit_x, digit_y, spm_x, &next_frame);
-            fb_fade_in();
+            fb_fade_in(&screen);
         } else {
-            fb_fill(0);
+            fb_fill(&screen, 0);
             draw_frame(digit_x, digit_y, spm_x, &next_frame);
-            fb_refresh();
+            fb_refresh(&screen);
         }
 
         prev_state = display_state;
@@ -223,7 +223,7 @@ static void *input_read_thread(void *data) {
 }
 
 int main() {
-    int ret = fb_init();
+    int ret = fb_init_all();
     if (ret)
         return ret;
 
@@ -234,7 +234,7 @@ int main() {
     int sockfd = socket(AF_INET, SOCK_DGRAM, 0);
     if (sockfd < 0) {
         perror("Failed to create a socket");
-        fb_close();
+        fb_close_all();
         return errno;
     }
 
@@ -244,7 +244,7 @@ int main() {
     servaddr.sin_family = AF_INET;
     if (bind(sockfd, (struct sockaddr*)&servaddr, sizeof(servaddr))) {
         perror("Failed to bind socket");
-        fb_close();
+        fb_close_all();
         close(sockfd);
         return errno;
     }
@@ -255,7 +255,7 @@ int main() {
     int ring_fd = open(RING_EVENT_PATH, O_RDONLY);
     if (btn_fd < 0 || ring_fd < 0) {
         perror("Failed to open event device");
-        fb_close();
+        fb_close_all();
         close(sockfd);
         return errno;
     }
@@ -344,7 +344,7 @@ int main() {
         }
     }
 
-    fb_close();
+    fb_close_all();
     close(btn_fd);
     close(ring_fd);
     close(sockfd);
