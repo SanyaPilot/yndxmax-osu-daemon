@@ -3,9 +3,9 @@
 #include <stdint.h>
 
 struct bitmap_font {
-    uint8_t width;
-    uint8_t height;
-    uint8_t startchar;
+    const uint8_t width;
+    const uint8_t height;
+    const uint8_t startchar;
     const uint8_t *data;
 };
 
@@ -19,6 +19,8 @@ int fb_init();
 void fb_close();
 void fb_refresh();
 void fb_fill(uint8_t val);
+void fb_fade_out();
+void fb_fade_in();
 
 extern const struct bitmap_font spleen_font;
 extern const struct bitmap_font digits_font;

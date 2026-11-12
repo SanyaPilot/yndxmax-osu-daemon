@@ -7,3 +7,6 @@
 #define TARGET_FPS      10
 #define FULL_SPIN_TICKS 60
 
+#define FADE_ANIM_DELAY         20
+#define FADE_ANIM_DURATION      300
+

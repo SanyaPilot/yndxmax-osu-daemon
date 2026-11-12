@@ -8,6 +8,7 @@
 #include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <sys/types.h>
+#include <time.h>
 #include <unistd.h>
 
 #include "fb.h"
@@ -88,6 +89,33 @@ void draw_string(const struct bitmap_font *font, char *str, uint8_t x, uint8_t y
         draw_char(font, str[i], x, y);
         x += font->width;
     }
+}
+
+static const uint8_t fade_step = 255 / (FADE_ANIM_DURATION / FADE_ANIM_DELAY);
+static const struct timespec fade_sleep_ts = { .tv_nsec = FADE_ANIM_DELAY * 1000000};
+
+void fb_fade_out() {
+    uint8_t val = 255;
+    do {
+        val = val >= fade_step ? (val - fade_step) : 0;
+        for (size_t i = 0; i < fb_info.buf_len; i++) {
+            fb_info.buf[i] = fb_info.buf[i] > 0 ? val : 0;
+        }
+        fb_refresh();
+        nanosleep(&fade_sleep_ts, NULL);
+    } while (val > 0);
+}
+
+void fb_fade_in() {
+    uint8_t val = 0;
+    do {
+        val = (255 - val) >= fade_step ? (val + fade_step) : 255;
+        for (size_t i = 0; i < fb_info.buf_len; i++) {
+            fb_info.buf[i] = fb_info.buf[i] > 0 ? val : 0;
+        }
+        fb_refresh();
+        nanosleep(&fade_sleep_ts, NULL);
+    } while (val < 255);
 }
 
 int fb_init() {

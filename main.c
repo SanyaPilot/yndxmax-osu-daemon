@@ -96,7 +96,38 @@ static void draw_timer(int time, bool enabled, uint8_t y) {
     }
 }
 
-void *display_thread(void *data) {
+static void draw_frame(uint8_t digit_x, uint8_t digit_y, uint8_t spm_x, struct timespec *next_frame) {
+    char str[4] = { 0 };
+    uint spm, spm_capped;
+    double elapsed;
+
+    switch (display_state) {
+        case DISPLAY_IDLE:
+            draw_timer(0, false, digit_y);
+            break;
+
+        case DISPLAY_TIME:
+            pthread_mutex_lock(&beatmap_timer_mutex);
+            elapsed = beatmap_timer.accumulated;
+            if (beatmap_timer.running)
+                elapsed += timespec_diff(next_frame, &beatmap_timer.last_start);
+            pthread_mutex_unlock(&beatmap_timer_mutex);
+            draw_timer(elapsed, true, digit_y);
+            break;
+
+        case DISPLAY_SPM:
+            pthread_mutex_lock(&ring_event_mutex);
+            spm = ((double)ring_event_count / FULL_SPIN_TICKS / (double)FRAME_TIME_MS) * 1000 * 60;
+            spm_capped = MIN(477, spm);
+            ring_event_count = 0;
+            pthread_mutex_unlock(&ring_event_mutex);
+            sprintf(str, "%03d", spm_capped);
+            draw_string(&digits_font, str, spm_x, digit_y);
+            break;
+    }
+}
+
+static void *display_thread(void *data) {
     draw_string(&spleen_font, "osu", 0, 0);
     fb_refresh();
 
@@ -105,45 +136,24 @@ void *display_thread(void *data) {
     struct timespec cur_time, next_frame;
     clock_gettime(CLOCK_MONOTONIC, &next_frame);
 
-    char str[4] = { 0 };
+    uint8_t prev_state = display_state;
 
-    // Time variables
     uint8_t digit_x = (25 - digits_font.width * 3 - 2) / 2;
     uint8_t digit_y = (16 - digits_font.height) / 2;
-    uint8_t div_y = digit_y + 2;
-    uint8_t minutes, seconds;
-    double elapsed;
-
-    // SPM variables
     uint8_t spm_x = (25 - digits_font.width * 3) / 2;
-    uint spm, spm_capped;
+
     while (1) {
-        fb_fill(0);
-        switch (display_state) {
-            case DISPLAY_IDLE:
-                draw_timer(0, false, digit_y);
-                break;
-
-            case DISPLAY_TIME:
-                pthread_mutex_lock(&beatmap_timer_mutex);
-                elapsed = beatmap_timer.accumulated;
-                if (beatmap_timer.running)
-                    elapsed += timespec_diff(&next_frame, &beatmap_timer.last_start);
-                pthread_mutex_unlock(&beatmap_timer_mutex);
-                draw_timer(elapsed, true, digit_y);
-                break;
-
-            case DISPLAY_SPM:
-                pthread_mutex_lock(&ring_event_mutex);
-                spm = ((double)ring_event_count / FULL_SPIN_TICKS / (double)FRAME_TIME_MS) * 1000 * 60;
-                spm_capped = MIN(477, spm);
-                ring_event_count = 0;
-                pthread_mutex_unlock(&ring_event_mutex);
-                sprintf(str, "%03d", spm_capped);
-                draw_string(&digits_font, str, spm_x, digit_y);
-                break;
+        if (display_state != prev_state) {
+            fb_fade_out();
+            draw_frame(digit_x, digit_y, spm_x, &next_frame);
+            fb_fade_in();
+        } else {
+            fb_fill(0);
+            draw_frame(digit_x, digit_y, spm_x, &next_frame);
+            fb_refresh();
         }
-        fb_refresh();
+
+        prev_state = display_state;
 
         timespec_add_ns(&next_frame, FRAME_TIME_NS);
         clock_gettime(CLOCK_MONOTONIC, &cur_time);
@@ -156,7 +166,7 @@ void *display_thread(void *data) {
     }
 }
 
-void *input_read_thread(void *data) {
+static void *input_read_thread(void *data) {
     struct input_thread_args *args = data;
     struct input_event event;
     char buf[32];
