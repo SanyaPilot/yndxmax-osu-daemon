@@ -31,6 +31,7 @@ void fb_close_all();
 void fb_refresh(struct fb_info *fb);
 void fb_fill(struct fb_info *fb, uint8_t val);
 void fb_fade_out(struct fb_info *fb);
+void fb_fade_out_all();
 void fb_fade_in(struct fb_info *fb);
 
 extern const struct bitmap_font spleen_font;

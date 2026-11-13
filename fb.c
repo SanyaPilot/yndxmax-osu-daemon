@@ -86,14 +86,28 @@ void draw_string(struct fb_info *fb, const struct bitmap_font *font, char *str, 
 static const uint8_t fade_step = 255 / (FADE_ANIM_DURATION / FADE_ANIM_DELAY);
 static const struct timespec fade_sleep_ts = { .tv_nsec = FADE_ANIM_DELAY * 1000000};
 
+static inline void fb_fade_step(struct fb_info *fb, uint8_t val) {
+    for (size_t i = 0; i < fb->buf_len; i++) {
+        fb->buf[i] = fb->buf[i] > 0 ? val : 0;
+    }
+    fb_refresh(fb);
+}
+
 void fb_fade_out(struct fb_info *fb) {
     uint8_t val = 255;
     do {
         val = val >= fade_step ? (val - fade_step) : 0;
-        for (size_t i = 0; i < fb->buf_len; i++) {
-            fb->buf[i] = fb->buf[i] > 0 ? val : 0;
-        }
-        fb_refresh(fb);
+        fb_fade_step(fb, val);
+        nanosleep(&fade_sleep_ts, NULL);
+    } while (val > 0);
+}
+
+void fb_fade_out_all() {
+    uint8_t val = 255;
+    do {
+        val = val >= fade_step ? (val - fade_step) : 0;
+        fb_fade_step(&screen, val);
+        fb_fade_step(&ring, val);
         nanosleep(&fade_sleep_ts, NULL);
     } while (val > 0);
 }
@@ -102,10 +116,7 @@ void fb_fade_in(struct fb_info *fb) {
     uint8_t val = 0;
     do {
         val = (255 - val) >= fade_step ? (val + fade_step) : 255;
-        for (size_t i = 0; i < fb->buf_len; i++) {
-            fb->buf[i] = fb->buf[i] > 0 ? val : 0;
-        }
-        fb_refresh(fb);
+        fb_fade_step(fb, val);
         nanosleep(&fade_sleep_ts, NULL);
     } while (val < 255);
 }

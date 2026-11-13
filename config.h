@@ -7,7 +7,7 @@
 #define PORT            1337
 #define BUF_SIZE        32
 
-#define TARGET_FPS      10
+#define TARGET_FPS      30
 #define FULL_SPIN_TICKS 60
 
 #define FADE_ANIM_DELAY         20

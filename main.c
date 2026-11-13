@@ -20,8 +20,9 @@
 #include "fb.h"
 #include "config.h"
 
-#define FRAME_TIME_NS (1000000000L / TARGET_FPS)
-#define FRAME_TIME_MS (1000 / TARGET_FPS)
+#define FRAME_TIME_NS   (1000000000L / TARGET_FPS)
+#define FRAME_TIME_MS   (1000 / TARGET_FPS)
+#define MS_TO_NS(x)     (x * 1000000L)
 
 #define MSG_DELIM ":"
 
@@ -31,10 +32,19 @@ enum display_state {
     DISPLAY_SPM
 };
 
+static bool display_refresh_req = false;
+static pthread_cond_t display_refresh = PTHREAD_COND_INITIALIZER;
+static pthread_mutex_t display_mutex = PTHREAD_MUTEX_INITIALIZER;
 static uint8_t display_state = DISPLAY_IDLE;
 
 static pthread_mutex_t ring_event_mutex = PTHREAD_MUTEX_INITIALIZER;
-static uint ring_event_count = 0;
+static struct {
+    uint events_per_frame;
+    int cur_rotation;
+    uint cur_max_rotation;
+    uint spin_count;
+    uint target_spin_count;
+} ring_counters = { 0 };
 
 static pthread_mutex_t beatmap_timer_mutex = PTHREAD_MUTEX_INITIALIZER;
 static struct {
@@ -96,15 +106,17 @@ static void draw_timer(int time, bool enabled, uint8_t y) {
     }
 }
 
-static void draw_frame(uint8_t digit_x, uint8_t digit_y, uint8_t spm_x, struct timespec *next_frame) {
+static long draw_frame(uint8_t digit_x, uint8_t digit_y, uint8_t spm_x, struct timespec *next_frame) {
     char str[4] = { 0 };
     uint spm, spm_capped;
+    uint8_t full_px;
+    float fill_len;
     double elapsed;
 
     switch (display_state) {
         case DISPLAY_IDLE:
             draw_timer(0, false, digit_y);
-            break;
+            return -1;
 
         case DISPLAY_TIME:
             pthread_mutex_lock(&beatmap_timer_mutex);
@@ -113,56 +125,94 @@ static void draw_frame(uint8_t digit_x, uint8_t digit_y, uint8_t spm_x, struct t
                 elapsed += timespec_diff(next_frame, &beatmap_timer.last_start);
             pthread_mutex_unlock(&beatmap_timer_mutex);
             draw_timer(elapsed, true, digit_y);
-            break;
+            return MS_TO_NS(1000);
 
         case DISPLAY_SPM:
             pthread_mutex_lock(&ring_event_mutex);
-            spm = ((double)ring_event_count / FULL_SPIN_TICKS / (double)FRAME_TIME_MS) * 1000 * 60;
+            spm = ((double)ring_counters.events_per_frame / FULL_SPIN_TICKS / (double)FRAME_TIME_MS) * 1000 * 60;
             spm_capped = MIN(477, spm);
-            ring_event_count = 0;
+            ring_counters.events_per_frame = 0;
+
+            fill_len = (float)ring.vinfo.xres / (float)ring_counters.target_spin_count *
+                (ring_counters.spin_count + (float)ring_counters.cur_max_rotation / (float)FULL_SPIN_TICKS);
+            full_px = (uint8_t)fill_len;
             pthread_mutex_unlock(&ring_event_mutex);
+
             sprintf(str, "%03d", spm_capped);
             draw_string(&screen, &digits_font, str, spm_x, digit_y);
-            break;
+
+            fb_fill(&ring, 0);
+            draw_line_h(&ring, 0, full_px, 0, 255);
+            set_pixel(&ring, full_px + 1, 0, 255.f * (fill_len - full_px));
+            fb_refresh(&ring);
+
+            return FRAME_TIME_NS;
     }
+    return -1;
 }
 
 static void *display_thread(void *data) {
     draw_string(&screen, &spleen_font, "osu", 0, 0);
     fb_refresh(&screen);
+    fb_refresh(&ring);
 
     sleep(2);
 
     struct timespec cur_time, next_frame;
     clock_gettime(CLOCK_MONOTONIC, &next_frame);
 
+    uint8_t local_state;
     uint8_t prev_state = display_state;
 
     uint8_t digit_x = (25 - digits_font.width * 3 - 2) / 2;
     uint8_t digit_y = (16 - digits_font.height) / 2;
     uint8_t spm_x = (25 - digits_font.width * 3) / 2;
 
+    long frametime;
+
     while (1) {
-        if (display_state != prev_state) {
-            fb_fade_out(&screen);
-            draw_frame(digit_x, digit_y, spm_x, &next_frame);
+        local_state = display_state;
+        if (local_state != prev_state) {
+            if (prev_state == DISPLAY_SPM) {
+                fb_fade_out_all();
+            } else {
+                fb_fade_out(&screen);
+            }
+            frametime = draw_frame(digit_x, digit_y, spm_x, &next_frame);
             fb_fade_in(&screen);
         } else {
             fb_fill(&screen, 0);
-            draw_frame(digit_x, digit_y, spm_x, &next_frame);
+            frametime = draw_frame(digit_x, digit_y, spm_x, &next_frame);
             fb_refresh(&screen);
         }
 
-        prev_state = display_state;
+        prev_state = local_state;
 
-        timespec_add_ns(&next_frame, FRAME_TIME_NS);
-        clock_gettime(CLOCK_MONOTONIC, &cur_time);
-        if (timespec_less(&next_frame, &cur_time)) {
-            // Drop frame
-            next_frame = cur_time;
-            timespec_add_ns(&next_frame, FRAME_TIME_NS);
+        pthread_mutex_lock(&display_mutex);
+        if (frametime > 0) {
+            timespec_add_ns(&next_frame, frametime);
+            clock_gettime(CLOCK_MONOTONIC, &cur_time);
+            if (timespec_less(&next_frame, &cur_time)) {
+                // Drop frame
+                next_frame = cur_time;
+                timespec_add_ns(&next_frame, frametime);
+            }
+            while (!display_refresh_req) {
+                int ret = pthread_cond_timedwait(&display_refresh, &display_mutex, &next_frame);
+                if (ret == ETIMEDOUT)
+                    break;
+            }
+        } else {
+            while (!display_refresh_req)
+                pthread_cond_wait(&display_refresh, &display_mutex);
         }
-        clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &next_frame, NULL);
+
+        // Update next frame time unconditionally (we don't know exact delay time)
+        clock_gettime(CLOCK_MONOTONIC, &cur_time);
+        next_frame = cur_time;
+
+        display_refresh_req = false;
+        pthread_mutex_unlock(&display_mutex);
     }
 }
 
@@ -179,17 +229,29 @@ static void *input_read_thread(void *data) {
     while (poll(fds, 2, -1) > 0) {
         if (fds[0].revents & POLLIN) {
             if (read(args->ring_fd, &event, sizeof(event)) > 0) {
-                printf("Ring event! [%ld] type: %d code: %d val: %d\n",
-                        event.time.tv_sec, event.type, event.code, event.value);
+                // printf("Ring event! [%ld] type: %d code: %d val: %d\n",
+                //         event.time.tv_sec, event.type, event.code, event.value);
 
                 if (event.type == EV_KEY && event.value == 0) {
-                    pthread_mutex_lock(&ring_event_mutex);
-                    if (prev_code != event.code)
-                        ring_event_count = 0;
-                    ring_event_count++;
-                    pthread_mutex_unlock(&ring_event_mutex);
+                    bool clockwise = event.code == KEY_PAGEUP;
+                    if (display_state == DISPLAY_SPM) {
+                        pthread_mutex_lock(&ring_event_mutex);
+                        if (prev_code != event.code)
+                            ring_counters.events_per_frame = 0;
+
+                        ring_counters.events_per_frame++;
+                        ring_counters.cur_rotation += clockwise ? 1 : -1;
+                        uint abs_rot = abs(ring_counters.cur_rotation);
+                        ring_counters.cur_max_rotation = MAX(abs_rot, ring_counters.cur_max_rotation);
+                        if (ring_counters.cur_max_rotation > FULL_SPIN_TICKS) {
+                            ring_counters.spin_count++;
+                            ring_counters.cur_rotation %= FULL_SPIN_TICKS;
+                            ring_counters.cur_max_rotation = abs(ring_counters.cur_rotation);
+                        }
+                        pthread_mutex_unlock(&ring_event_mutex);
+                    }
                     prev_code = event.code;
-                    sprintf(buf, "ring:%s", event.code == KEY_PAGEUP ? "cw" : "ccw");
+                    sprintf(buf, "ring:%s", clockwise ? "cw" : "ccw");
                     if (sendto(args->sockfd, buf, strlen(buf), 0,
                                 (const struct sockaddr *)args->cliaddr, *args->cli_len) < 0) {
                         perror("sendto failed");
@@ -222,12 +284,24 @@ static void *input_read_thread(void *data) {
     perror("poll failed");
 }
 
+static inline void request_disp_refresh() {
+    pthread_mutex_lock(&display_mutex);
+    display_refresh_req = true;
+    pthread_cond_signal(&display_refresh);
+    pthread_mutex_unlock(&display_mutex);
+}
+
 int main() {
     int ret = fb_init_all();
     if (ret)
         return ret;
 
     pthread_t d_thread;
+    pthread_condattr_t cond_attr;
+    pthread_condattr_init(&cond_attr);
+    pthread_condattr_setclock(&cond_attr, CLOCK_MONOTONIC);
+    pthread_cond_init(&display_refresh, &cond_attr);
+    pthread_condattr_destroy(&cond_attr);
     pthread_create(&d_thread, NULL, display_thread, NULL);
 
     struct sockaddr_in servaddr;
@@ -301,11 +375,22 @@ int main() {
                 continue;
 
             if (strcmp(token, "time") == 0) {
-                printf("Settings screen to TIME mode!\n");
+                printf("Setting screen to TIME mode!\n");
                 display_state = DISPLAY_TIME;
+                request_disp_refresh();
             } else if (strcmp(token, "spm") == 0) {
-                printf("Settings screen to SPM mode!\n");
+                token = strtok_r(NULL, MSG_DELIM, &strtok_save);
+                if (token == NULL) {
+                    continue;
+                }
+                printf("Setting screen to SPM mode!\n");
+                pthread_mutex_lock(&ring_event_mutex);
+                memset(&ring_counters, 0, sizeof(ring_counters));
+                ring_counters.target_spin_count = atoi(token);
+                pthread_mutex_unlock(&ring_event_mutex);
+
                 display_state = DISPLAY_SPM;
+                request_disp_refresh();
             }
         } else if (strcmp(token, "action") == 0) {
             token = strtok_r(NULL, MSG_DELIM, &strtok_save);
@@ -325,10 +410,12 @@ int main() {
                 clock_gettime(CLOCK_MONOTONIC, &beatmap_timer.last_start);
                 beatmap_timer.running = true;
                 display_state = DISPLAY_TIME;
+                request_disp_refresh();
             } else if (strcmp(token, "stop") == 0) {
                 printf("Beatmap stopped\n");
                 beatmap_timer.running = false;
                 display_state = DISPLAY_IDLE;
+                request_disp_refresh();
             } else if (strcmp(token, "pause") == 0) {
                 printf("Beatmap paused\n");
                 struct timespec now;
