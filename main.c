@@ -20,8 +20,10 @@
 #include "fb.h"
 #include "config.h"
 
-#define FRAME_TIME_NS   (1000000000L / TARGET_FPS)
-#define FRAME_TIME_MS   (1000 / TARGET_FPS)
+#define SPM_FRAME_TIME_NS       (1000000000L / RING_SPIN_FPS)
+#define SPM_FRAME_TIME_MS       (1000 / RING_SPIN_FPS)
+#define FRAMES_FOR_SPM_UPDATE   (RING_SPIN_FPS / SCREEN_SPM_FPS)
+
 #define MS_TO_NS(x)     (x * 1000000L)
 
 #define MSG_DELIM ":"
@@ -59,6 +61,17 @@ struct input_thread_args {
     int sockfd;
     struct sockaddr_in *cliaddr;
     socklen_t *cli_len;
+};
+
+struct frame_data {
+    uint8_t state;
+    const uint8_t digit_x;
+    const uint8_t digit_y;
+    const uint8_t spm_x;
+
+    uint spm_cached;
+    uint8_t spm_frames;
+    struct timespec next_frame;
 };
 
 static inline void timespec_add_ns(struct timespec *ts, long ns) {
@@ -106,47 +119,57 @@ static void draw_timer(int time, bool enabled, uint8_t y) {
     }
 }
 
-static long draw_frame(uint8_t digit_x, uint8_t digit_y, uint8_t spm_x, struct timespec *next_frame) {
+static long draw_frame(struct frame_data *data) {
     char str[4] = { 0 };
-    uint spm, spm_capped;
+    uint spm;
     uint8_t full_px;
     float fill_len;
     double elapsed;
 
-    switch (display_state) {
+    switch (data->state) {
         case DISPLAY_IDLE:
-            draw_timer(0, false, digit_y);
+            draw_timer(0, false, data->digit_y);
             return -1;
 
         case DISPLAY_TIME:
             pthread_mutex_lock(&beatmap_timer_mutex);
             elapsed = beatmap_timer.accumulated;
             if (beatmap_timer.running)
-                elapsed += timespec_diff(next_frame, &beatmap_timer.last_start);
+                elapsed += timespec_diff(&data->next_frame, &beatmap_timer.last_start);
             pthread_mutex_unlock(&beatmap_timer_mutex);
-            draw_timer(elapsed, true, digit_y);
+            draw_timer(elapsed, true, data->digit_y);
             return MS_TO_NS(1000);
 
         case DISPLAY_SPM:
             pthread_mutex_lock(&ring_event_mutex);
-            spm = ((double)ring_counters.events_per_frame / FULL_SPIN_TICKS / (double)FRAME_TIME_MS) * 1000 * 60;
-            spm_capped = MIN(477, spm);
-            ring_counters.events_per_frame = 0;
+
+            // Draw SPM on every frame, BUT update it's value only every N frames
+            // to avoid creating another thread only for the ring, which should update
+            // at a higher frame rate
+            if (data->spm_frames >= FRAMES_FOR_SPM_UPDATE) {
+                spm = ((double)ring_counters.events_per_frame / FULL_SPIN_TICKS /
+                        ((double)SPM_FRAME_TIME_MS * data->spm_frames)) * 1000 * 60;
+                data->spm_cached = MIN(477, spm);
+                ring_counters.events_per_frame = 0;
+                data->spm_frames = 0;
+            }
 
             fill_len = (float)ring.vinfo.xres / (float)ring_counters.target_spin_count *
                 (ring_counters.spin_count + (float)ring_counters.cur_max_rotation / (float)FULL_SPIN_TICKS);
             full_px = (uint8_t)fill_len;
             pthread_mutex_unlock(&ring_event_mutex);
 
-            sprintf(str, "%03d", spm_capped);
-            draw_string(&screen, &digits_font, str, spm_x, digit_y);
+            sprintf(str, "%03d", data->spm_cached);
+            draw_string(&screen, &digits_font, str, data->spm_x, data->digit_y);
 
             fb_fill(&ring, 0);
-            draw_line_h(&ring, 0, full_px, 0, 255);
-            set_pixel(&ring, full_px + 1, 0, 255.f * (fill_len - full_px));
+            if (full_px > 0)
+                draw_line_h(&ring, 0, full_px - 1, 0, 255);
+            set_pixel(&ring, full_px, 0, 255.f * (fill_len - full_px));
             fb_refresh(&ring);
 
-            return FRAME_TIME_NS;
+            data->spm_frames++;
+            return SPM_FRAME_TIME_NS;
     }
     return -1;
 }
@@ -158,47 +181,46 @@ static void *display_thread(void *data) {
 
     sleep(2);
 
-    struct timespec cur_time, next_frame;
-    clock_gettime(CLOCK_MONOTONIC, &next_frame);
-
-    uint8_t local_state;
-    uint8_t prev_state = display_state;
-
-    uint8_t digit_x = (25 - digits_font.width * 3 - 2) / 2;
-    uint8_t digit_y = (16 - digits_font.height) / 2;
-    uint8_t spm_x = (25 - digits_font.width * 3) / 2;
-
+    struct timespec cur_time;
     long frametime;
+    uint8_t prev_state = display_state;
+    struct frame_data frame_data = {
+        .digit_x = (screen.vinfo.xres - digits_font.width * 3 - 2) / 2,
+        .digit_y = (screen.vinfo.yres - digits_font.height) / 2,
+        .spm_x = (screen.vinfo.xres - digits_font.width * 3 + 1) / 2,
+    };
 
+    clock_gettime(CLOCK_MONOTONIC, &frame_data.next_frame);
     while (1) {
-        local_state = display_state;
-        if (local_state != prev_state) {
+        frame_data.state = display_state;
+        if (frame_data.state != prev_state) {
+            frame_data.spm_cached = 0;
+            frame_data.spm_frames = 0;
             if (prev_state == DISPLAY_SPM) {
                 fb_fade_out_all();
             } else {
                 fb_fade_out(&screen);
             }
-            frametime = draw_frame(digit_x, digit_y, spm_x, &next_frame);
+            frametime = draw_frame(&frame_data);
             fb_fade_in(&screen);
         } else {
             fb_fill(&screen, 0);
-            frametime = draw_frame(digit_x, digit_y, spm_x, &next_frame);
+            frametime = draw_frame(&frame_data);
             fb_refresh(&screen);
         }
-
-        prev_state = local_state;
+        prev_state = frame_data.state;
 
         pthread_mutex_lock(&display_mutex);
         if (frametime > 0) {
-            timespec_add_ns(&next_frame, frametime);
+            timespec_add_ns(&frame_data.next_frame, frametime);
             clock_gettime(CLOCK_MONOTONIC, &cur_time);
-            if (timespec_less(&next_frame, &cur_time)) {
+            if (timespec_less(&frame_data.next_frame, &cur_time)) {
                 // Drop frame
-                next_frame = cur_time;
-                timespec_add_ns(&next_frame, frametime);
+                frame_data.next_frame = cur_time;
+                timespec_add_ns(&frame_data.next_frame, frametime);
             }
             while (!display_refresh_req) {
-                int ret = pthread_cond_timedwait(&display_refresh, &display_mutex, &next_frame);
+                int ret = pthread_cond_timedwait(&display_refresh, &display_mutex, &frame_data.next_frame);
                 if (ret == ETIMEDOUT)
                     break;
             }
@@ -209,7 +231,7 @@ static void *display_thread(void *data) {
 
         // Update next frame time unconditionally (we don't know exact delay time)
         clock_gettime(CLOCK_MONOTONIC, &cur_time);
-        next_frame = cur_time;
+        frame_data.next_frame = cur_time;
 
         display_refresh_req = false;
         pthread_mutex_unlock(&display_mutex);
